@@ -47,13 +47,19 @@ than leaving the other ranks waiting at a barrier that never comes.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 __all__ = ["describe_env", "require_parallel_env", "rank0_write",
-           "physical_cores"]
+           "physical_cores", "ranks_on_this_node"]
 
 THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+
+# Threads a healthy rank holds beyond its compute threads: the interpreter and
+# the MPI library keep their own. Three measured with mpi4py on Open MPI and
+# OMP_NUM_THREADS=1 (WSL, 2026-09-22).
+RUNTIME_THREADS = 3
 
 
 def _world():
@@ -111,16 +117,57 @@ def physical_cores() -> int:
     return os.cpu_count() or 1
 
 
+def _expand_slurm_counts(spec: str) -> list[int]:
+    """Slurm's compressed per-node task list: '8(x2),7' -> [8, 8, 7]."""
+    out = []
+    for part in spec.split(","):
+        m = re.fullmatch(r"(\d+)(?:\(x(\d+)\))?", part.strip())
+        if not m:
+            return []
+        out += [int(m.group(1))] * int(m.group(2) or 1)
+    return out
+
+
+def ranks_on_this_node() -> int | None:
+    """Ranks the launcher placed on this node, or None if it did not say.
+
+    The oversubscription check must compare this with the physical cores, not
+    the total rank count: SLURM_NTASKS counts every node of the job, and until
+    2026-09-22 a correct 16-rank job on two 8-core nodes was refused as
+    "16 ranks on 8 cores".
+    """
+    for var in ("OMPI_COMM_WORLD_LOCAL_SIZE",      # Open MPI
+                "MPI_LOCALNRANKS"):                # MPICH, Intel MPI (Hydra)
+        v = os.environ.get(var, "")
+        if v.isdigit():
+            return int(v)
+    spec = (os.environ.get("SLURM_STEP_TASKS_PER_NODE")
+            or os.environ.get("SLURM_TASKS_PER_NODE"))
+    if spec:
+        counts = _expand_slurm_counts(spec)
+        node = int(os.environ.get("SLURM_NODEID", "0") or 0)
+        if 0 <= node < len(counts):
+            return counts[node]
+    return None
+
+
 def describe_env(expect_ranks: int | None = None) -> dict:
     rank, size, source = _world()
     slurm = os.environ.get("SLURM_NTASKS")
     if expect_ranks is None and slurm:
         expect_ranks = int(slurm)
+    nodes = int(os.environ.get("SLURM_JOB_NUM_NODES")
+                or os.environ.get("SLURM_NNODES") or 1)
+    local = ranks_on_this_node()
+    if local is None and nodes == 1:
+        local = expect_ranks            # one machine: every rank is local
     return {
         "mpi_source": source,
         "rank": rank,
         "world_size": size,
         "expect_ranks": expect_ranks,
+        "nodes": nodes,
+        "ranks_on_node": local,
         "threads_in_process": threads_in_this_process(),
         "thread_env": {v: os.environ.get(v) for v in THREAD_VARS},
         "logical_cpus": os.cpu_count(),
@@ -149,15 +196,14 @@ def require_parallel_env(expect_ranks: int | None = None, *,
             f"world, so every rank guard will pass on every rank.")
 
     # 2. is each rank single-threaded?  (2026-09-06)
-    # A healthy pinned rank still shows two or three threads: the interpreter
-    # keeps a couple of its own. The pathology is different in kind, not degree
-    # -- the thread count tracks the CORE count, because the BLAS asked the
-    # machine how big it is. So the gate is "as many threads as there are
-    # cores", with a small allowance on top of the requested limit.
+    # A healthy rank still holds RUNTIME_THREADS of the interpreter's and the
+    # MPI library's own. The pathology is a thread per core, because the BLAS
+    # asked the machine how big it is, so the limit plus that allowance is the
+    # whole gate. Until 2026-09-22 it also failed any rank holding as many
+    # threads as the node has cores, which refused a healthy 3-thread rank on
+    # a 2-core machine.
     n_thr = env["threads_in_process"]
-    ceiling = max(max_threads + 3, 0)
-    if n_thr > 0 and max_threads and (n_thr > ceiling
-                                      or n_thr >= env["physical_cores"]):
+    if n_thr > 0 and max_threads and n_thr > max_threads + RUNTIME_THREADS:
         problems.append(
             f"this rank holds {n_thr} threads against a limit of {max_threads}. "
             f"Set OMP_NUM_THREADS / OPENBLAS_NUM_THREADS / MKL_NUM_THREADS to 1 "
@@ -165,16 +211,47 @@ def require_parallel_env(expect_ranks: int | None = None, *,
             f"thread per core and they will fight. Nothing will error and each "
             f"rank will still report full CPU use.")
 
-    # 3. are we asking for more ranks than there are slots?
-    if (env["expect_ranks"] or 0) > env["physical_cores"]:
+    # 2b. are the thread limits set at all?  (2026-09-22)
+    # The live count sees only threads that exist when the gate runs. A BLAS
+    # built with OpenMP starts them at its first call: under mpirun on WSL with
+    # OMP_NUM_THREADS unset, conda-forge numpy held 3 threads at the gate and
+    # 18 after one matrix product. (The pip numpy of our GPAW env starts them
+    # at import, 18 at the gate, and the count catches that.) The variables
+    # are known up front, so check them as well. Neither check covers the
+    # other: GPAW sets OMP_NUM_THREADS=1 when imported, so if numpy came first
+    # the variable reads 1 while 18 threads already run.
+    if max_threads:
+        te = env["thread_env"]
+        bad = [f"{v}={te[v]}" for v in THREAD_VARS[:3]
+               if (te.get(v) or "").strip()
+               and not (te[v].strip().isdigit()
+                        and 0 < int(te[v]) <= max_threads)]
+        if not (te.get("OMP_NUM_THREADS") or "").strip():
+            bad.insert(0, "OMP_NUM_THREADS unset")
+        if bad:
+            problems.append(
+                f"thread limit above {max_threads}: {', '.join(bad)}. A BLAS "
+                f"built with OpenMP starts its threads at the first "
+                f"calculation, so the count above cannot see this yet. Export "
+                f"OMP_NUM_THREADS={max_threads} before launching (and pass it "
+                f"with mpirun -x on more than one node).")
+
+    # 3. more ranks on this node than it has physical cores?
+    # Per node: on a multi-node job whose launcher did not say how many ranks
+    # it put here, ranks_on_node is None and this is not checked.
+    local = env["ranks_on_node"]
+    if (local or 0) > env["physical_cores"]:
         problems.append(
-            f"{env['expect_ranks']} ranks requested on {env['physical_cores']} "
+            f"{local} ranks on this node, which has {env['physical_cores']} "
             f"physical cores ({env['logical_cpus']} logical). Open MPI counts a "
-            f"slot per physical core and will refuse, or oversubscribe if forced.")
+            f"slot per physical core and refuses this unless oversubscription "
+            f"is forced, and a forced run shares cores between ranks.")
 
     if verbose and env["rank"] == 0:
+        thr = (f"{n_thr} threads/rank" if n_thr > 0 else
+               "threads/rank not checked (no /proc on this OS)")
         print(f"[mpi_env_check] {env['mpi_source']}: world {env['world_size']}"
-              f", {n_thr} threads/rank, {env['physical_cores']} physical cores"
+              f", {thr}, {env['physical_cores']} physical cores"
               f" ({env['logical_cpus']} logical)")
     if problems:
         if env["rank"] == 0:
@@ -218,7 +295,14 @@ if __name__ == "__main__":
     for k, v in e.items():
         print(f"  {k}: {v}")
     ok = True
-    if e["threads_in_process"] >= max(4, e["physical_cores"]):
+    if not (e["thread_env"]["OMP_NUM_THREADS"] or "").strip():
+        print("\n  WARNING: OMP_NUM_THREADS is unset. An OpenMP BLAS will start "
+              "a thread per core at its first calculation, in every rank.")
+        ok = False
+    if e["threads_in_process"] < 0:
+        print("\n  NOTE: no /proc on this OS, so the thread count is unknown "
+              "and require_parallel_env will not check it.")
+    elif e["threads_in_process"] > 1 + RUNTIME_THREADS:
         print("\n  WARNING: more than one thread per process. Set "
               "OMP_NUM_THREADS=1 before launching under MPI.")
         ok = False

@@ -44,11 +44,31 @@ So this is a gate, not a report. It exits.
 | declared | checked against |
 | --- | --- |
 | `expect_ranks` | the actual MPI world size, or `SLURM_NTASKS` if you leave it out |
-| `max_threads` | the thread-count environment variables, and the cores available |
+| `max_threads` | `OMP_NUM_THREADS` (must be set), `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` (if set), and the threads this process actually holds |
+| (nothing) | the ranks the launcher put on this node, against its physical cores |
 
 A world size of 1 when you asked for 8 is the first failure above, and it is the
 one worth gating hardest: it is the only one where every rank believes it is in
 charge.
+
+Threads are checked twice because each check misses something. Measured under
+`mpirun` with the variables unset:
+
+- conda-forge numpy (OpenMP BLAS) held 3 threads at the top of the job and 18
+  after one matrix product. The live count (from `/proc/self/task`) sees only
+  threads that already exist, so only the variable check catches this.
+- pip numpy, as used with GPAW, held 18 threads from import. GPAW sets
+  `OMP_NUM_THREADS=1` when it is imported, so if numpy was imported first the
+  variable reads 1 while 18 threads already run. Only the live count catches
+  this.
+
+The live count needs `/proc`, so on macOS and Windows it is skipped and the
+start-up line says so. `max_threads=0` turns both off.
+
+Ranks per node come from `OMPI_COMM_WORLD_LOCAL_SIZE` (Open MPI),
+`MPI_LOCALNRANKS` (MPICH, Intel MPI) or Slurm's per-node task list. On a
+multi-node job where none of these is set, that check is skipped rather than
+guessed.
 
 `describe_env()` returns the same facts without exiting, for logging at the start
 of a run. Print it. A run whose log does not record its own world size cannot be
@@ -70,8 +90,17 @@ no error anywhere.
 
 It finds the world from `gpaw.mpi` or `mpi4py`, whichever is importable, and
 falls back to a serial stand-in so a script written for a cluster still runs on
-one machine. The stand-in reports `serial` rather than pretending to be a world
-of size 1, because that pretence is the first failure in the list.
+one machine. The stand-in is a world of size 1 whose source is reported as
+`serial`, so a log line tells "no MPI at all" apart from "an MPI world of size
+1", which is the first failure in the list.
+
+## Tests
+
+```
+python test_mpi_env_check.py
+```
+
+No MPI needed: the world, the thread count and the core count are replaced.
 
 ## Requirements
 
